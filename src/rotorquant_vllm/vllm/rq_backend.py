@@ -109,6 +109,34 @@ def _parse_iso_mode() -> str:
     return mode
 
 
+
+
+# ---------------------------------------------------------------------------
+# Fused paged decode feature gate
+# ---------------------------------------------------------------------------
+
+_fused_paged_kernel_available = False
+_fused_paged_rq_decode_fn = None
+try:
+    from rotorquant_vllm.triton.fused_paged_rq_decode import (
+        fused_paged_rq_decode as _fused_paged_rq_decode_fn,
+    )
+
+    _fused_paged_kernel_available = True
+except (ImportError, RuntimeError) as exc:
+    logger.info("Fused paged RQ decode kernel unavailable: %s", exc)
+
+
+def _parse_rq_fused_paged_env() -> bool:
+    """Parse ``RQ_USE_FUSED_PAGED`` environment variable.
+
+    Returns:
+        ``True`` when the env var is set to a truthy value
+        (``"1"``, ``"true"``, ``"yes"``; case-insensitive).
+        ``False`` for everything else including absent.
+    """
+    return os.environ.get("RQ_USE_FUSED_PAGED", "").lower() in ("1", "true", "yes")
+
 # ---------------------------------------------------------------------------
 # Cache size helpers — nibble-packed
 # ---------------------------------------------------------------------------
@@ -133,6 +161,21 @@ def _rq_bytes_per_token_kv(head_dim: int, num_kv_heads: int) -> int:
     return _rq_bytes_per_component(head_dim, num_kv_heads) * 2
 
 
+def _rq_padded_slot_bytes(head_dim: int) -> int:
+    """Padded per-head slot (K+V combined) for hybrid model page alignment.
+
+    Returns ``next_power_of_2(raw_slot)`` so RQ pages are divisible by
+    Mamba layer pages in hybrid models (e.g. Qwen3.5).
+    Padding bytes are unused by kernels.
+    """
+    from vllm.utils.math_utils import next_power_of_2
+
+    return next_power_of_2(_rq_bytes_per_token_kv(head_dim, 1))
+
+
+def _rq_total_bytes(head_dim: int, num_kv_heads: int) -> int:
+    """Total bytes per token slot (padded per head * num heads)."""
+    return num_kv_heads * _rq_padded_slot_bytes(head_dim)
 # ---------------------------------------------------------------------------
 # Rotation matrix builders
 # ---------------------------------------------------------------------------
@@ -227,7 +270,7 @@ class RQFullAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:  # noqa: D102
-        return self.block_size * _rq_bytes_per_token_kv(self.head_size, self.num_kv_heads)
+        return self.block_size * _rq_total_bytes(self.head_size, self.num_kv_heads)
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +291,17 @@ class RQMetadataBuilder(FlashAttentionMetadataBuilder):
         vllm_config: object,
         kv_cache_spec: object,
     ) -> AttentionCGSupport:
-        """No CUDA graph support for v0 (dynamic compress/decompress)."""
+        """Report CUDA graph support: single-token decode when fused available.
+
+        When fused paged decode is available and enabled, decode goes through
+        the fused kernel path which is CG-safe.  Otherwise, decode uses
+        dynamic decompress operations incompatible with CUDA graphs.
+        """
+        # Support CUDA graphs for single-token decode when fused paged kernel is available
+        if _fused_paged_kernel_available and _parse_rq_fused_paged_env():
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
         return AttentionCGSupport.NEVER
+
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +350,7 @@ class RQAttentionBackend(FlashAttentionBackend):
             [K_indices(all heads, nibble-packed) | K_norms(all heads) |
              V_indices(all heads, nibble-packed) | V_norms(all heads)]
         """
-        total_bytes = _rq_bytes_per_token_kv(head_size, num_kv_heads)
+        total_bytes = _rq_total_bytes(head_size, num_kv_heads)
         return (num_blocks, block_size, total_bytes)
 
     @staticmethod
@@ -413,7 +465,9 @@ class RQAttentionImpl(FlashAttentionImpl):
         R = _build_rotation_matrix(k_quantizer, head_size, device)
         self._rq_rot = R
         self._rq_rot_T = R.T.contiguous()
-
+        # Pre-split R^T into even/odd columns for tiled compress kernel
+        self._rq_rot_T_even = self._rq_rot_T[:, 0::2].contiguous()  # (D, HALF_D) fp32
+        self._rq_rot_T_odd = self._rq_rot_T[:, 1::2].contiguous()   # (D, HALF_D) fp32
         # Half dimension for nibble packing
         self._half_d = head_size // 2
 
@@ -422,7 +476,7 @@ class RQAttentionImpl(FlashAttentionImpl):
         self._k_idx_end = num_kv_heads * k_idx_per_head
         self._k_norm_end = self._k_idx_end + num_kv_heads * RQ_NORM_BYTES
         self._v_idx_end = self._k_norm_end + num_kv_heads * k_idx_per_head
-        self._total_bytes = self._v_idx_end + num_kv_heads * RQ_NORM_BYTES
+        self._total_bytes = _rq_total_bytes(head_size, num_kv_heads)
 
         # Pre-allocated buffers flag and limits
         self._cg_buffers_ready = False
@@ -432,6 +486,12 @@ class RQAttentionImpl(FlashAttentionImpl):
         self._max_prefill_len = (
             vllm_config.scheduler_config.max_num_batched_tokens
             if vllm_config is not None else 2048
+        )
+
+
+        # Fused paged decode feature gate.
+        self._fused_paged_available = (
+            _parse_rq_fused_paged_env() and _fused_paged_kernel_available
         )
 
         # Log compression ratio
@@ -447,6 +507,10 @@ class RQAttentionImpl(FlashAttentionImpl):
             v_bits,
             self._total_bytes,
             compression,
+        )
+        logger.info(
+            "Fused paged RQ decode: %s",
+            "enabled" if self._fused_paged_available else "disabled",
         )
 
     # ------------------------------------------------------------------
@@ -531,19 +595,16 @@ class RQAttentionImpl(FlashAttentionImpl):
             N, self._total_bytes, dtype=torch.uint8, device=key.device
         )
 
-        # Compress K
+        # Compress K — tiled matmul with pre-split R^T columns
         if self._rq_mode == 'iso':
-            q_R_k = getattr(self._k_quantizer, 'q_R', None)
-            iso_mode_k = getattr(self._k_quantizer, 'mode', 'fast')
             k_packed, k_norms = iso_compress(
-                key, self._k_quantizer.q_L, q_R_k, self._k_quantizer.centroids,
-                mode=iso_mode_k,
-                d_padded=self._k_quantizer.d_padded,
+                key, self._rq_rot_T_even, self._rq_rot_T_odd,
+                self._k_quantizer.boundaries,
             )
         else:
             k_packed, k_norms = planar_compress(
-                key, self._k_quantizer.rot2, self._k_quantizer.centroids,
-                d_padded=self._k_quantizer.d_padded,
+                key, self._rq_rot_T_even, self._rq_rot_T_odd,
+                self._k_quantizer.boundaries,
             )
 
         # K indices: pack per-head nibble regions into contiguous bytes
@@ -554,19 +615,16 @@ class RQAttentionImpl(FlashAttentionImpl):
             k_norms.reshape(N, H).contiguous().view(torch.uint8)
         )
 
-        # Compress V
+        # Compress V — tiled matmul with pre-split R^T columns
         if self._rq_mode == 'iso':
-            q_R_v = getattr(self._v_quantizer, 'q_R', None)
-            iso_mode_v = getattr(self._v_quantizer, 'mode', 'fast')
             v_packed, v_norms = iso_compress(
-                value, self._v_quantizer.q_L, q_R_v, self._v_quantizer.centroids,
-                mode=iso_mode_v,
-                d_padded=self._v_quantizer.d_padded,
+                value, self._rq_rot_T_even, self._rq_rot_T_odd,
+                self._v_quantizer.boundaries,
             )
         else:
             v_packed, v_norms = planar_compress(
-                value, self._v_quantizer.rot2, self._v_quantizer.centroids,
-                d_padded=self._v_quantizer.d_padded,
+                value, self._rq_rot_T_even, self._rq_rot_T_odd,
+                self._v_quantizer.boundaries,
             )
 
         # V indices: pack per-head nibble regions

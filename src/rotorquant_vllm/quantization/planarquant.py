@@ -96,6 +96,7 @@ class PlanarQuantMSE(nn.Module):
         # Lloyd-Max codebook: centroids stored as fp32 buffer
         cb = LloydMaxCodebook(d, bits)
         self.register_buffer('centroids', cb.centroids.to(device))
+        self.register_buffer('boundaries', cb.boundaries.to(device))
 
         # Random 2D rotations (cos theta, sin theta) -- one per group, fp32
         rot = make_random_rotations(self.n_groups, device=device, seed=seed)

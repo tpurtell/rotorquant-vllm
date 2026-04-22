@@ -89,6 +89,7 @@ class IsoQuantMSE(nn.Module):
         # Lloyd-Max codebook: centroids stored as fp32 buffer
         cb = LloydMaxCodebook(d, bits)
         self.register_buffer('centroids', cb.centroids.to(device))
+        self.register_buffer('boundaries', cb.boundaries.to(device))
 
         # Random unit quaternions (one per group), stored as fp32 buffer
         q_L = make_random_unit_quaternion((self.n_groups,), device=device, seed=seed)
