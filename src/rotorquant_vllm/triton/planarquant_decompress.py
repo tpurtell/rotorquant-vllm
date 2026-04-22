@@ -1,11 +1,11 @@
 """
-Triton kernels for PlanarQuant decompress: nibble unpack → gather centroids → norm scale → cast.
+Triton kernels for PlanarQuant decompress: nibble unpack -> gather centroids -> norm scale -> cast.
 
-Decompress path: nibble unpack packed bytes → gather centroid values → scale by norm → cast to dtype.
-No inverse rotation needed (Q pre-rotation path, rotation applied to Q in attention impl).
+Decompress path (no inverse rotation): load nibble-packed bytes -> unpack indices
+-> gather centroids -> scale by norm -> cast to target dtype.
+
+Rotation is applied to Q once (O(1) per step), so K/V decompress in rotated space.
 """
-
-import math
 
 import torch
 import triton
@@ -22,101 +22,83 @@ def _planar_decompress_kernel(
     HALF_D,
     D,
     HALF_D_PAD: tl.constexpr,
-    n_levels: tl.constexpr,
-    BLOCK_HALF_D: tl.constexpr,
 ):
     """Decompress kernel: one program per row.
 
     Steps per row:
-      1. Load HALF_D packed bytes, nibble unpack to get 2 index streams
-      2. Gather centroid values for each index
-      3. Scale by norm, interleave even/odd positions
-      4. Store first D elements to output
+      1. Load HALF_D nibble-packed bytes
+      2. Unpack into two index streams (hi=even pos, lo=odd pos)
+      3. Gather centroids, scale by norm
+      4. Interleave and store: even=hi, odd=lo (first D elements)
     """
     pid = tl.program_id(0)
 
-    # Load norm for this row
-    norm = tl.load(norms_ptr + pid)
+    p_offs = tl.arange(0, HALF_D_PAD)
+    p_mask = p_offs < HALF_D
 
-    # Load packed nibble bytes and unpack
-    half_d_offs = tl.arange(0, BLOCK_HALF_D)
-    packed_ptrs = packed_ptr + pid * HALF_D_PAD + half_d_offs
-    packed_vals = tl.load(packed_ptrs, mask=half_d_offs < HALF_D, other=0).to(tl.int32)
+    # Load packed bytes
+    packed = tl.load(packed_ptr + pid * HALF_D + p_offs, mask=p_mask, other=0).to(tl.int32)
 
-    # Nibble unpack: high nibble = even index, low nibble = odd index
-    hi_idx = (packed_vals >> 4) & 0x0F
-    lo_idx = packed_vals & 0x0F
+    # Nibble unpack
+    hi_idx = ((packed >> 4) & 0x0F).to(tl.int32)
+    lo_idx = (packed & 0x0F).to(tl.int32)
 
-    # Gather centroid values
-    q_hi = tl.load(centroids_ptr + hi_idx).to(tl.float32)
-    q_lo = tl.load(centroids_ptr + lo_idx).to(tl.float32)
+    # Centroid gather
+    c_hi = tl.load(centroids_ptr + hi_idx).to(tl.float32)
+    c_lo = tl.load(centroids_ptr + lo_idx).to(tl.float32)
 
     # Scale by norm
-    f_hi = q_hi * norm
-    f_lo = q_lo * norm
+    norm = tl.load(norms_ptr + pid)
+    c_hi = c_hi * norm
+    c_lo = c_lo * norm
 
-    # Interleave: even positions = hi, odd positions = lo
-    # Write to output at positions 2*g and 2*g+1
-    for g in range(BLOCK_HALF_D):
-        even_off = 2 * g
-        odd_off = 2 * g + 1
-        tl.store(out_ptr + pid * D + even_off, f_hi, mask=even_off < D)
-        tl.store(out_ptr + pid * D + odd_off, f_lo, mask=odd_off < D)
+    # Interleave and store: even=hi, odd=lo
+    out_base = pid * D
+    tl.store(out_ptr + out_base + p_offs * 2, c_hi,
+             mask=p_mask & (p_offs * 2 < D))
+    tl.store(out_ptr + out_base + p_offs * 2 + 1, c_lo,
+             mask=p_mask & (p_offs * 2 + 1 < D))
 
 
 def planar_decompress(packed: torch.Tensor,
                       norms: torch.Tensor,
                       centroids: torch.Tensor,
-                      dtype: torch.dtype,
-                      d_padded: int | None = None) -> torch.Tensor:
-    """Decompress nibble-packed uint8 indices + fp32 norms back to float tensor via PlanarQuant.
+                      dtype: torch.dtype) -> torch.Tensor:
+    """Decompress nibble-packed uint8 + fp32 norms back to float tensor via PlanarQuant.
 
     Args:
-        packed: uint8 nibble-packed indices of shape (N, H, HALF_D).
-        norms:  fp32 norms of shape (N, H, 1).
+        packed:    nibble-packed uint8 indices of shape (N, H, HALF_D).
+        norms:     fp32 norms of shape (N, H, 1).
         centroids: Lloyd-Max centroids of shape (n_levels,), dtype fp32.
-        dtype: Target output dtype (torch.float16 or torch.bfloat16).
-        d_padded: Padded dimension (multiple of 2). Auto-computed if None.
+        dtype:     Target output dtype (torch.float16 or torch.bfloat16).
 
     Returns:
-        out: (N, H, D) tensor in target dtype.
+        out: (N, H, D) tensor in target dtype, where D = HALF_D * 2.
     """
     N, H, HALF_D = packed.shape
     D = HALF_D * 2
-
-    if d_padded is not None:
-        D = d_padded
-
     M = N * H
-
-    # Compute padded dimensions for Triton
     HALF_D_PAD = triton.next_power_of_2(HALF_D)
 
     packed_cont = packed.reshape(M, HALF_D).contiguous()
-    norms_cont = norms.reshape(M).contiguous().float()
-    centroids_f32 = centroids.float().contiguous()
+    norms_cont = norms.reshape(M).contiguous()
 
-    out = torch.empty(M, D, device=packed.device, dtype=dtype)
-
-    BLOCK_HALF_D = min(HALF_D_PAD, 64)
-
-    try:
-        _planar_decompress_kernel[(M,)](
-            packed_cont,
-            norms_cont,
-            centroids_f32,
-            out,
-            M,
-            HALF_D,
-            D,
-            HALF_D_PAD=HALF_D_PAD,
-            n_levels=centroids.shape[0],
-            BLOCK_HALF_D=BLOCK_HALF_D,
-        )
-    except Exception:
+    if not packed.is_cuda:
         return _planar_decompress_cpu(packed, norms, centroids, dtype)
 
-    return out.reshape(N, H, D).to(dtype)
+    out = torch.empty(M, D, dtype=dtype, device=packed.device)
+    grid = (M,)
+    _planar_decompress_kernel[grid](
+        packed_cont,
+        norms_cont,
+        centroids,
+        out,
+        M,
+        HALF_D,
+        D,
+        HALF_D_PAD=HALF_D_PAD,
+    )
+    return out.reshape(N, H, D)
 
 
 def _planar_decompress_cpu(packed: torch.Tensor,
@@ -128,23 +110,24 @@ def _planar_decompress_cpu(packed: torch.Tensor,
     D = HALF_D * 2
     M = N * H
 
-    flat_packed = packed.reshape(M, HALF_D)
+    packed_flat = packed.reshape(M, HALF_D)
     norms_flat = norms.reshape(M).float()
 
-    # Nibble unpack: high nibble = even index, low nibble = odd index
-    hi_idx = ((flat_packed >> 4) & 0x0F).long()  # (M, HALF_D)
-    lo_idx = (flat_packed & 0x0F).long()  # (M, HALF_D)
+    # Nibble unpack
+    hi_idx = ((packed_flat >> 4) & 0x0F).long()
+    lo_idx = (packed_flat & 0x0F).long()
 
-    # Gather centroid values
-    q_hi = centroids[hi_idx]  # (M, HALF_D)
-    q_lo = centroids[lo_idx]  # (M, HALF_D)
+    # Gather centroids
+    c_hi = centroids[hi_idx].float()
+    c_lo = centroids[lo_idx].float()
 
-    # Interleave: even positions = hi, odd positions = lo
-    result = torch.zeros(M, D, device=packed.device, dtype=torch.float32)
-    result[:, 0::2] = q_hi
-    result[:, 1::2] = q_lo
+    # Scale by norm
+    c_hi = c_hi * norms_flat.unsqueeze(-1)
+    c_lo = c_lo * norms_flat.unsqueeze(-1)
 
-    # Scale by norms
-    result = result * norms_flat.unsqueeze(-1)
+    # Interleave: even=hi, odd=lo
+    out = torch.zeros(M, D, device=packed.device, dtype=torch.float32)
+    out[:, 0::2] = c_hi
+    out[:, 1::2] = c_lo
 
-    return result.reshape(N, H, D).to(dtype)
+    return out.reshape(N, H, D).to(dtype)

@@ -82,26 +82,22 @@ def iso_decompress(packed: torch.Tensor,
     HALF_D_PAD = triton.next_power_of_2(HALF_D)
 
     packed_cont = packed.reshape(M, HALF_D).contiguous()
-    norms_cont = norms.reshape(M).contiguous().float()
-    centroids_f32 = centroids.float().contiguous()
-
-    out = torch.empty(M, D, device=packed.device, dtype=dtype)
-
-    try:
-        _iso_decompress_kernel[(M,)](
-            packed_cont,
-            norms_cont,
-            centroids_f32,
-            out,
-            M,
-            HALF_D,
-            D,
-            HALF_D_PAD=HALF_D_PAD,
-        )
-    except Exception:
+    norms_cont = norms.reshape(M).contiguous()
+    if not packed.is_cuda:
         return _iso_decompress_cpu(packed, norms, centroids, dtype)
-
-    return out.reshape(N, H, D).to(dtype)
+    out = torch.empty(M, D, dtype=dtype, device=packed.device)
+    grid = (M,)
+    _iso_decompress_kernel[grid](
+        packed_cont,
+        norms_cont,
+        centroids,
+        out,
+        M,
+        HALF_D,
+        D,
+        HALF_D_PAD=HALF_D_PAD,
+    )
+    return out.reshape(N, H, D)
 
 
 def _iso_decompress_cpu(packed: torch.Tensor,
