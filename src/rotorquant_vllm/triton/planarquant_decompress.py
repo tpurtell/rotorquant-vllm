@@ -96,7 +96,7 @@ def planar_decompress(packed: torch.Tensor,
     norms_cont = norms.reshape(M).contiguous().float()
     centroids_f32 = centroids.float().contiguous()
 
-    out = torch.empty(M, D, device=packed.device, dtype=torch.float32)
+    out = torch.empty(M, D, device=packed.device, dtype=dtype)
 
     BLOCK_HALF_D = min(HALF_D_PAD, 64)
 
