@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+rq_backend = rotorquant_vllm.vllm:register_rq_backend

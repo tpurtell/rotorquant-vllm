@@ -1,0 +1,8 @@
+torch>=2.6
+scipy>=1.10
+triton>=3.0
+vllm>=0.19
+
+[dev]
+pytest>=8.0
+ruff>=0.9

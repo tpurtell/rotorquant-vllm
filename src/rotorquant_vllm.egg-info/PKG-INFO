@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: rotorquant-vllm
+Version: 0.1.0
+Summary: RotorQuant KV cache compression for vLLM — IsoQuant/PlanarQuant Triton kernels, block-diagonal rotations, 10.3x compression
+Author: John D. Pope
+License: MIT
+Project-URL: Homepage, https://github.com/scrya-com/rotorquant-vllm
+Project-URL: Repository, https://github.com/scrya-com/rotorquant-vllm
+Keywords: ai,quantization,rotorquant,isoquant,planarquant,kv-cache,inference-optimization,vllm,triton
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Typing :: Typed
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.6
+Requires-Dist: scipy>=1.10
+Requires-Dist: triton>=3.0
+Requires-Dist: vllm>=0.19
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.9; extra == "dev"

@@ -1,0 +1,72 @@
+[project]
+name = "rotorquant-vllm"
+version = "0.1.0"
+description = "RotorQuant KV cache compression for vLLM — IsoQuant/PlanarQuant Triton kernels, block-diagonal rotations, 10.3x compression"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "John D. Pope" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.6",
+    "scipy>=1.10",
+    "triton>=3.0",
+    "vllm>=0.19",
+]
+keywords = [
+    "ai",
+    "quantization",
+    "rotorquant",
+    "isoquant",
+    "planarquant",
+    "kv-cache",
+    "inference-optimization",
+    "vllm",
+    "triton",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/scrya-com/rotorquant-vllm"
+Repository = "https://github.com/scrya-com/rotorquant-vllm"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+
+# Register the RotorQuant attention backend as vLLM's CUSTOM backend.
+[project.entry-points."vllm.general_plugins"]
+rq_backend = "rotorquant_vllm.vllm:register_rq_backend"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "__pycache__", "*.egg-info"]
+
+[tool.ruff.lint]
+extend-select = ["E501", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: GPU tests (require CUDA)",
+]
