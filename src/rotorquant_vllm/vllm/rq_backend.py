@@ -2,11 +2,13 @@
 
 Integrates RotorQuant's IsoQuant (4D quaternion) and PlanarQuant (2D Givens)
 KV cache compression into vLLM as a drop-in plugin.  Stores compressed KV
-cache as uint8 bytes with layout:
+cache as uint8 bytes with nibble-packed layout:
 
-    [K_indices(all heads) | K_norms(all heads) | V_indices(all heads) | V_norms(all heads)]
+    [K_indices(all heads, nibble-packed) | K_norms(all heads) |
+     V_indices(all heads, nibble-packed) | V_norms(all heads)]
 
-Each component per head: ``head_dim`` int8 indices + 1 fp32 norm.
+Q pre-rotation + output post-rotation: rotation matrix applied once per step
+to Q (forward) and attention output (inverse), avoiding O(cache_len) matmuls.
 """
 
 from __future__ import annotations
@@ -32,6 +34,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from rotorquant_vllm.quantization.isoquant import IsoQuantMSE
 from rotorquant_vllm.quantization.planarquant import PlanarQuantMSE
+from rotorquant_vllm.triton.isoquant_compress import iso_compress
+from rotorquant_vllm.triton.isoquant_decompress import iso_decompress
+from rotorquant_vllm.triton.planarquant_compress import planar_compress
+from rotorquant_vllm.triton.planarquant_decompress import planar_decompress
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadataBuilder
@@ -104,26 +110,105 @@ def _parse_iso_mode() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cache size helpers
+# Cache size helpers — nibble-packed
 # ---------------------------------------------------------------------------
 
 
 def _rq_bytes_per_component(head_dim: int, num_kv_heads: int) -> int:
-    """Bytes for one component (K or V): all heads' int8 indices + all heads' fp32 norms.
+    """Bytes for one component (K or V): nibble-packed indices + norms.
 
-    Layout: [K_indices_0 | K_indices_1 | ... | K_norm_0 | K_norm_1 | ...]
-    where indices are int8 (1 byte/coord) and norms are fp32 (4 bytes/head).
+    Nibble-packed: 2 indices per byte, so half_d = head_dim // 2 bytes per head.
+    Norms: 4 bytes per head (fp32).
     """
-    return num_kv_heads * head_dim + num_kv_heads * RQ_NORM_BYTES
+    half_d = head_dim // 2
+    return num_kv_heads * half_d + num_kv_heads * RQ_NORM_BYTES
 
 
 def _rq_bytes_per_token_kv(head_dim: int, num_kv_heads: int) -> int:
     """Total bytes per token (K + V combined, all heads).
 
     For 8 heads, head_dim=128:
-        8 * (128 + 4) * 2 = 2112 bytes vs 4096 FP16 K+V = ~1.94x compression
+        8 * (64 + 4) * 2 = 1088 bytes vs 4096 FP16 K+V = ~3.76x compression
     """
     return _rq_bytes_per_component(head_dim, num_kv_heads) * 2
+
+
+# ---------------------------------------------------------------------------
+# Rotation matrix builders
+# ---------------------------------------------------------------------------
+
+
+def _build_iso_R(quantizer, d: int, device, mode: str = 'fast') -> torch.Tensor:
+    """Build rotation matrix from IsoQuant quaternion parameters.
+
+    Returns D×D block-diagonal matrix R where R maps unit vectors to rotated space.
+    """
+    n_groups = quantizer.n_groups
+    D_pad = quantizer.d_padded
+    R = torch.eye(D_pad, dtype=torch.float32, device=device)
+    for g in range(n_groups):
+        base = g * 4
+        qL = quantizer.q_L[g]  # (4,) [w,x,y,z]
+        ql_w, ql_x, ql_y, ql_z = qL[0], qL[1], qL[2], qL[3]
+
+        # Left multiply matrix (q_L * v):
+        M_left = torch.tensor([
+            [ql_w, -ql_x, -ql_y, -ql_z],
+            [ql_x,  ql_w, -ql_z,  ql_y],
+            [ql_y,  ql_z,  ql_w, -ql_x],
+            [ql_z, -ql_y,  ql_x,  ql_w],
+        ], dtype=torch.float32, device=device)
+
+        if mode == 'full':
+            qR = quantizer.q_R[g]
+            qr_w, qr_x, qr_y, qr_z = qR[0], qR[1], qR[2], qR[3]
+            # Right multiply by conj(q_R):
+            M_right = torch.tensor([
+                [qr_w,  qr_x,  qr_y,  qr_z],
+                [-qr_x, qr_w, -qr_z,  qr_y],
+                [-qr_y, qr_z,  qr_w, -qr_x],
+                [-qr_z, -qr_y, qr_x,  qr_w],
+            ], dtype=torch.float32, device=device)
+            R[base:base + 4, base:base + 4] = M_left @ M_right
+        else:
+            # Fast mode: left mult by q_L, then right mult by conj(q_L)
+            M_conj_L = torch.tensor([
+                [ql_w,  ql_x,  ql_y,  ql_z],
+                [-ql_x, ql_w, -ql_z,  ql_y],
+                [-ql_y, ql_z,  ql_w, -ql_x],
+                [-ql_z, -ql_y, ql_x,  ql_w],
+            ], dtype=torch.float32, device=device)
+            R[base:base + 4, base:base + 4] = M_left @ M_conj_L
+    return R[:d, :d]
+
+
+def _build_planar_R(quantizer, d: int, device) -> torch.Tensor:
+    """Build rotation matrix from PlanarQuant Givens parameters.
+
+    Returns D×D block-diagonal matrix R where R maps unit vectors to rotated space.
+    """
+    n_groups = quantizer.n_groups
+    D_pad = quantizer.d_padded
+    R = torch.eye(D_pad, dtype=torch.float32, device=device)
+    for g in range(n_groups):
+        base = g * 2
+        c = quantizer.rot2[g, 0]
+        s = quantizer.rot2[g, 1]
+        R[base:base + 2, base:base + 2] = torch.tensor(
+            [[c, -s], [s, c]], dtype=torch.float32, device=device
+        )
+    return R[:d, :d]
+
+
+def _build_rotation_matrix(quantizer, d: int, device) -> torch.Tensor:
+    """Build full D×D rotation matrix from quantizer block parameters."""
+    if hasattr(quantizer, 'q_L'):
+        # IsoQuantMSE
+        mode = getattr(quantizer, 'mode', 'fast')
+        return _build_iso_R(quantizer, d, device, mode)
+    else:
+        # PlanarQuantMSE
+        return _build_planar_R(quantizer, d, device)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +221,7 @@ class RQFullAttentionSpec(FullAttentionSpec):
     """KV cache spec with RotorQuant compressed page size.
 
     Overrides ``real_page_size_bytes`` so the block allocator provisions
-    buffers sized for the packed RotorQuant format (int8 indices + fp32 norms).
+    buffers sized for the packed RotorQuant format (nibble-packed indices + fp32 norms).
     Uses ``dtype=torch.uint8`` for the uint8 byte cache.
     """
 
@@ -175,9 +260,9 @@ class RQMetadataBuilder(FlashAttentionMetadataBuilder):
 class RQAttentionBackend(FlashAttentionBackend):
     """RotorQuant compressed KV cache attention backend.
 
-    Stores KV cache as packed uint8 bytes (int8 indices + fp32 norms).
+    Stores KV cache as packed uint8 bytes (nibble-packed indices + fp32 norms).
     Each forward() call decompresses cached K/V to FP16, runs Flash
-    Attention, then returns the output.
+    Attention, then returns the output with Q pre-rotation and output post-rotation.
     """
 
     forward_includes_kv_cache_update = True
@@ -210,8 +295,8 @@ class RQAttentionBackend(FlashAttentionBackend):
 
         Last dimension packs K and V data for all heads as raw bytes::
 
-            [K_indices(all heads) | K_norms(all heads) |
-             V_indices(all heads) | V_norms(all heads)]
+            [K_indices(all heads, nibble-packed) | K_norms(all heads) |
+             V_indices(all heads, nibble-packed) | V_norms(all heads)]
         """
         total_bytes = _rq_bytes_per_token_kv(head_size, num_kv_heads)
         return (num_blocks, block_size, total_bytes)
@@ -232,13 +317,17 @@ class RQAttentionBackend(FlashAttentionBackend):
 class RQAttentionImpl(FlashAttentionImpl):
     """RotorQuant attention: compress -> store -> decompress -> Flash Attention.
 
-    Stores packed bytes (int8 indices + fp32 norms) in a uint8 cache.
+    Stores nibble-packed bytes (4-bit indices + fp32 norms) in a uint8 cache.
+    Q pre-rotation + output post-rotation avoids O(cache_len) inverse rotations.
+
     Each ``forward()`` call:
 
-    1. Compresses incoming K/V tokens via rotation + Lloyd-Max quantization.
+    1. Compresses incoming K/V tokens (nibble-packed, rotated space).
     2. Scatter-writes packed bytes to the uint8 cache.
-    3. Decompresses the cache to FP16 (gather centroids + inverse rotate + rescale).
-    4. Calls ``flash_attn_varlen_func`` with the FP16 data.
+    3. Pre-rotates Q by R^T (forward rotation into rotated space).
+    4. Paged-decompresses cached K/V to compute dtype (no inverse rotation).
+    5. Calls ``flash_attn_varlen_func`` with rotated Q and decompressed K/V.
+    6. Post-rotates output by R (inverse rotation back to original space).
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -292,7 +381,6 @@ class RQAttentionImpl(FlashAttentionImpl):
         self._k_quantizer = k_quantizer
         self._v_quantizer = v_quantizer
 
-        # Common buffers for both modes
         for buf_name in ("centroids",):
             for quantizer in (k_quantizer, v_quantizer):
                 buf = getattr(quantizer, buf_name, None)
@@ -319,25 +407,36 @@ class RQAttentionImpl(FlashAttentionImpl):
                     if buf is not None and buf.device != device:
                         buf.data = buf.to(device)
 
-        # Byte layout offsets within the last dimension of the packed cache.
-        # Layout per-token: [K_indices | K_norms | V_indices | V_norms]
-        #   K_indices: num_kv_heads * head_size bytes (int8)
-        #   K_norms:   num_kv_heads * RQ_NORM_BYTES (fp32 viewed as uint8)
-        #   V_indices: num_kv_heads * head_size bytes (int8)
-        #   V_norms:   num_kv_heads * RQ_NORM_BYTES (fp32 viewed as uint8)
-        k_idx_end = num_kv_heads * head_size
-        k_norm_end = k_idx_end + num_kv_heads * RQ_NORM_BYTES
-        v_idx_end = k_norm_end + num_kv_heads * head_size
-        total_bytes = v_idx_end + num_kv_heads * RQ_NORM_BYTES
+        # Build rotation matrix R (original -> rotated space)
+        # Q pre-rotation: q_rot = q @ R^T
+        # Output post-rotation: out_orig = out_rot @ R
+        R = _build_rotation_matrix(k_quantizer, head_size, device)
+        self._rq_rot = R
+        self._rq_rot_T = R.T.contiguous()
 
-        self._k_idx_end = k_idx_end
-        self._k_norm_end = k_norm_end
-        self._v_idx_end = v_idx_end
-        self._total_bytes = total_bytes
+        # Half dimension for nibble packing
+        self._half_d = head_size // 2
+
+        # Byte layout offsets (nibble-packed)
+        k_idx_per_head = self._half_d
+        self._k_idx_end = num_kv_heads * k_idx_per_head
+        self._k_norm_end = self._k_idx_end + num_kv_heads * RQ_NORM_BYTES
+        self._v_idx_end = self._k_norm_end + num_kv_heads * k_idx_per_head
+        self._total_bytes = self._v_idx_end + num_kv_heads * RQ_NORM_BYTES
+
+        # Pre-allocated buffers flag and limits
+        self._cg_buffers_ready = False
+        self._max_model_len = (
+            vllm_config.model_config.max_model_len if vllm_config is not None else 8192
+        )
+        self._max_prefill_len = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+            if vllm_config is not None else 2048
+        )
 
         # Log compression ratio
         fp16_total = 2 * num_kv_heads * head_size * 2  # K+V in fp16
-        compression = fp16_total / total_bytes
+        compression = fp16_total / self._total_bytes
         logger.info(
             "RQAttentionImpl: %s mode, %d KV heads, head_size=%d, "
             "k_bits=%d, v_bits=%d, %d bytes/token (%.2fx compression vs FP16)",
@@ -346,31 +445,63 @@ class RQAttentionImpl(FlashAttentionImpl):
             head_size,
             k_bits,
             v_bits,
-            total_bytes,
+            self._total_bytes,
             compression,
         )
 
     # ------------------------------------------------------------------
-    # Compress path
+    # Pre-allocated scratch buffers
     # ------------------------------------------------------------------
 
-    def _compress_tensor(
-        self, x: torch.Tensor, quantizer
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compress a tensor via rotation + Lloyd-Max quantization.
+    def _init_cg_buffers(self, kv_cache, compute_dtype):
+        """Lazy-allocate scratch buffers bounded by max_model_len."""
+        num_blocks, block_size, _ = kv_cache.shape
+        max_tokens = min(self._max_model_len, num_blocks * block_size)
+        device = kv_cache.device
+        H = self.num_kv_heads
+        D = self.head_size
+        half_D = self._half_d
 
-        Args:
-            x: ``(N, H, D)`` input tensor (fp16/bf16).
-            quantizer: IsoQuantMSE or PlanarQuantMSE instance.
+        # Decompress buffers (paged decompress output)
+        self._cg_decompress_k = torch.empty(
+            max_tokens, H, D, dtype=compute_dtype, device=device
+        )
+        self._cg_decompress_v = torch.empty_like(self._cg_decompress_k)
 
-        Returns:
-            (indices, norms) where indices is ``(N, H, D)`` int8
-            and norms is ``(N, H)`` fp32 (one norm per head).
-        """
-        v_q, indices_dict = quantizer.quantize(x)
-        indices = indices_dict["indices"].to(torch.int8)  # (N, H, D)
-        norms = indices_dict["_norms"].to(torch.float32)  # (N, H) — ensure fp32 for 4-byte storage
-        return indices, norms
+        # Prefill buffers
+        prefill_tokens = min(self._max_prefill_len, max_tokens)
+        self._cg_prefill_k = torch.empty(
+            prefill_tokens, H, D, dtype=compute_dtype, device=device
+        )
+        self._cg_prefill_v = torch.empty_like(self._cg_prefill_k)
+        self._max_prefill_blocks = prefill_tokens // block_size
+
+        # Compress output buffers
+        self._cg_compress_packed = torch.empty(
+            1, H, half_D, dtype=torch.uint8, device=device
+        )
+        self._cg_compress_norms = torch.empty(
+            1, H, 1, dtype=torch.float32, device=device
+        )
+
+        # Q rotation buffers
+        self._cg_q_rot = torch.empty(
+            1, self.num_heads, D, dtype=torch.float32, device=device
+        )
+        self._cg_q_rot_cast = torch.empty(
+            1, self.num_heads, D, dtype=compute_dtype, device=device
+        )
+
+        # Compress row buffer
+        self._cg_compress_row = torch.empty(
+            1, self._total_bytes, dtype=torch.uint8, device=device
+        )
+
+        self._cg_buffers_ready = True
+
+    # ------------------------------------------------------------------
+    # Compress path — nibble-packed
+    # ------------------------------------------------------------------
 
     def _compress_and_store(
         self,
@@ -378,71 +509,94 @@ class RQAttentionImpl(FlashAttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
+        compress_out=None,
+        row_out=None,
     ) -> None:
-        """Compress K/V and scatter-write packed bytes to cache.
+        """Compress K/V to nibble-packed format and scatter-write to cache.
 
         Args:
             key: ``(N, H, D)`` new key tokens.
             value: ``(N, H, D)`` new value tokens.
             kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
             slot_mapping: ``(num_actual_tokens,)`` flat slot indices.
+            compress_out: Optional (packed_buf, norms_buf) tuple for pre-allocated output.
+            row_out: Optional pre-allocated row buffer ``(N, total_bytes)`` uint8.
         """
         N = key.shape[0]
+        H = self.num_kv_heads
         num_actual = slot_mapping.shape[0]
 
-        # Compress K and V
-        k_indices, k_norms = self._compress_tensor(key, self._k_quantizer)
-        v_indices, v_norms = self._compress_tensor(value, self._v_quantizer)
-
-        # Build packed byte row per token:
-        #   [K_indices(all heads) | K_norms(all heads) | V_indices(all heads) | V_norms(all heads)]
-        row = torch.empty(N, self._total_bytes, dtype=torch.uint8, device=key.device)
-
-        # Indices: (N, H, D) int8 → (N, H*D) uint8
-        row[:, : self._k_idx_end] = k_indices.reshape(N, -1).to(torch.uint8)
-        # Norms: (N, H) fp32 → view as uint8 → (N, H*4)
-        row[:, self._k_idx_end : self._k_norm_end] = (
-            k_norms.reshape(N, -1).contiguous().view(torch.uint8)
+        # Use pre-allocated buffer or create temporary
+        row = row_out[:N] if row_out is not None else torch.empty(
+            N, self._total_bytes, dtype=torch.uint8, device=key.device
         )
-        row[:, self._k_norm_end : self._v_idx_end] = v_indices.reshape(N, -1).to(torch.uint8)
-        row[:, self._v_idx_end :] = (
-            v_norms.reshape(N, -1).contiguous().view(torch.uint8)
+
+        # Compress K
+        if self._rq_mode == 'iso':
+            q_R_k = getattr(self._k_quantizer, 'q_R', None)
+            iso_mode_k = getattr(self._k_quantizer, 'mode', 'fast')
+            k_packed, k_norms = iso_compress(
+                key, self._k_quantizer.q_L, q_R_k, self._k_quantizer.centroids,
+                mode=iso_mode_k,
+                d_padded=self._k_quantizer.d_padded,
+            )
+        else:
+            k_packed, k_norms = planar_compress(
+                key, self._k_quantizer.rot2, self._k_quantizer.centroids,
+                d_padded=self._k_quantizer.d_padded,
+            )
+
+        # K indices: pack per-head nibble regions into contiguous bytes
+        k_packed_flat = k_packed.reshape(N, H * self._half_d)
+        row[:, :self._k_idx_end] = k_packed_flat
+        # K norms: fp32 -> uint8 view
+        row[:, self._k_idx_end:self._k_norm_end] = (
+            k_norms.reshape(N, H).contiguous().view(torch.uint8)
+        )
+
+        # Compress V
+        if self._rq_mode == 'iso':
+            q_R_v = getattr(self._v_quantizer, 'q_R', None)
+            iso_mode_v = getattr(self._v_quantizer, 'mode', 'fast')
+            v_packed, v_norms = iso_compress(
+                value, self._v_quantizer.q_L, q_R_v, self._v_quantizer.centroids,
+                mode=iso_mode_v,
+                d_padded=self._v_quantizer.d_padded,
+            )
+        else:
+            v_packed, v_norms = planar_compress(
+                value, self._v_quantizer.rot2, self._v_quantizer.centroids,
+                d_padded=self._v_quantizer.d_padded,
+            )
+
+        # V indices: pack per-head nibble regions
+        v_packed_flat = v_packed.reshape(N, H * self._half_d)
+        row[:, self._k_norm_end:self._v_idx_end] = v_packed_flat
+        # V norms: fp32 -> uint8 view
+        row[:, self._v_idx_end:self._total_bytes] = (
+            v_norms.reshape(N, H).contiguous().view(torch.uint8)
         )
 
         # Scatter-write to flat cache using slot_mapping
         flat_cache = kv_cache.view(-1, kv_cache.shape[-1])
-        flat_cache[slot_mapping[:num_actual], : self._total_bytes] = row[:num_actual]
+        flat_cache[slot_mapping[:num_actual], :self._total_bytes] = row[:num_actual]
 
     # ------------------------------------------------------------------
-    # Decompress path
+    # Decompress path — nibble unpack, no rotation
     # ------------------------------------------------------------------
-
-    def _decompress_tensor(
-        self, indices: torch.Tensor, norms: torch.Tensor, quantizer
-    ) -> torch.Tensor:
-        """Decompress quantized indices and norms back to fp16/bf16.
-
-        Args:
-            indices: ``(num_tokens, H, D)`` int8 indices.
-            norms: ``(num_tokens, H)`` fp32 norms (one per head).
-            quantizer: IsoQuantMSE or PlanarQuantMSE instance.
-
-        Returns:
-            ``(num_tokens, H, D)`` reconstructed tensor.
-        """
-        x_hat = quantizer.dequantize({"indices": indices.to(torch.int64), "_norms": norms})
-        return x_hat
 
     def _decompress_cache(
         self,
         kv_cache: torch.Tensor,
         compute_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decompress the full packed cache to FP16.
+        """Decompress the full packed cache to compute dtype (rotated space).
+
+        No inverse rotation — K/V stored in rotated space.
 
         Args:
             kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
-            compute_dtype: Output dtype (e.g., ``torch.bfloat16``).
+            compute_dtype: Output dtype.
 
         Returns:
             (key_cache, value_cache) each ``(NB, BS, H, D)``.
@@ -450,38 +604,59 @@ class RQAttentionImpl(FlashAttentionImpl):
         NB, BS, _ = kv_cache.shape
         H = self.num_kv_heads
         D = self.head_size
+        half_D = self._half_d
         num_tokens = NB * BS
 
-        # Flatten to (num_tokens, total_bytes)
         flat = kv_cache.reshape(num_tokens, -1)
 
-        # Extract K regions
-        k_indices = flat[:, : self._k_idx_end].contiguous().to(torch.int8).reshape(-1, H, D)
-        k_norms = (
-            flat[:, self._k_idx_end : self._k_norm_end]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1, H)
-        )
+        # Extract K per head and decompress
+        k_packed_list = []
+        for h in range(H):
+            start = h * half_D
+            k_packed_list.append(flat[:, start:start + half_D])
+        k_packed = torch.stack(k_packed_list, dim=1)  # (M, H, half_D)
 
-        # Extract V regions
-        v_indices = (
-            flat[:, self._k_norm_end : self._v_idx_end].contiguous().to(torch.int8).reshape(-1, H, D)
-        )
-        v_norms = (
-            flat[:, self._v_idx_end : self._total_bytes]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1, H)
-        )
+        k_norms_raw = flat[:, self._k_idx_end:self._k_norm_end].contiguous().view(
+            torch.float32
+        ).reshape(-1, H, 1)
 
-        # Decompress
-        key_out = self._decompress_tensor(k_indices, k_norms, self._k_quantizer).to(compute_dtype)
-        value_out = self._decompress_tensor(v_indices, v_norms, self._v_quantizer).to(compute_dtype)
+        # Decompress K (no rotation)
+        if self._rq_mode == 'iso':
+            k_out = iso_decompress(
+                k_packed, k_norms_raw, self._k_quantizer.centroids, compute_dtype
+            )
+        else:
+            k_out = planar_decompress(
+                k_packed, k_norms_raw, self._k_quantizer.centroids, compute_dtype,
+                d_padded=self._k_quantizer.d_padded,
+            )
+
+        # Extract V per head and decompress
+        v_packed_list = []
+        for h in range(H):
+            start = self._k_norm_end + h * half_D
+            end = start + half_D
+            v_packed_list.append(flat[:, start:end])
+        v_packed = torch.stack(v_packed_list, dim=1)  # (M, H, half_D)
+
+        v_norms_raw = flat[:, self._v_idx_end:self._total_bytes].contiguous().view(
+            torch.float32
+        ).reshape(-1, H, 1)
+
+        # Decompress V (no rotation)
+        if self._rq_mode == 'iso':
+            v_out = iso_decompress(
+                v_packed, v_norms_raw, self._v_quantizer.centroids, compute_dtype
+            )
+        else:
+            v_out = planar_decompress(
+                v_packed, v_norms_raw, self._v_quantizer.centroids, compute_dtype,
+                d_padded=self._v_quantizer.d_padded,
+            )
 
         return (
-            key_out.reshape(NB, BS, H, D),
-            value_out.reshape(NB, BS, H, D),
+            k_out.reshape(NB, BS, H, D),
+            v_out.reshape(NB, BS, H, D),
         )
 
     def _decompress_cache_paged(
@@ -490,25 +665,30 @@ class RQAttentionImpl(FlashAttentionImpl):
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
         compute_dtype: torch.dtype,
+        out_k: torch.Tensor | None = None,
+        out_v: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decompress only the physical blocks referenced by block_table.
 
-        Not CUDA-graph-safe: uses ``torch.unique`` for block selection.
+        Paged decompression: extract unique blocks, decompress them,
+        build remapped block table for Flash Attention.
 
         Args:
             kv_cache: ``(NB, BS, total_bytes)`` uint8 packed cache.
             block_table: ``(batch, max_blocks_per_seq)`` int32 block table.
             seq_lens: ``(batch,)`` sequence lengths.
             compute_dtype: Output dtype.
+            out_k: Pre-allocated buffer ``(max_tokens, H, D)`` or None.
+            out_v: Pre-allocated buffer ``(max_tokens, H, D)`` or None.
 
         Returns:
             (key_cache, value_cache, remapped_block_table) where
-            key/value are ``(num_unique_blocks, BS, H, D)`` and
-            remapped_block_table maps logical blocks to compact indices.
+            key/value are ``(num_unique_blocks, BS, H, D)``.
         """
         NB, BS, _ = kv_cache.shape
         H = self.num_kv_heads
         D = self.head_size
+        half_D = self._half_d
 
         # Extract valid block indices from block_table using seq_lens
         max_blocks_per_seq = block_table.shape[1]
@@ -520,44 +700,81 @@ class RQAttentionImpl(FlashAttentionImpl):
         unique_blocks = torch.unique(valid_block_indices, sorted=True)
         num_unique = unique_blocks.numel()
 
-        # Gather referenced blocks and decompress
+        # Select referenced blocks
+        max_cap = out_k.shape[0] // BS if out_k is not None else 0
+
         selected = kv_cache[unique_blocks]  # (num_unique, BS, total_bytes)
         flat = selected.reshape(num_unique * BS, -1)
 
-        k_indices = flat[:, : self._k_idx_end].contiguous().to(torch.int8).reshape(-1, H, D)
-        k_norms = (
-            flat[:, self._k_idx_end : self._k_norm_end]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1, H)
-        )
-        v_indices = (
-            flat[:, self._k_norm_end : self._v_idx_end]
-            .contiguous()
-            .to(torch.int8)
-            .reshape(-1, H, D)
-        )
-        v_norms = (
-            flat[:, self._v_idx_end : self._total_bytes]
-            .contiguous()
-            .view(torch.float32)
-            .reshape(-1, H)
-        )
+        # Extract and decompress K
+        k_packed_list = []
+        for h in range(H):
+            start = h * half_D
+            k_packed_list.append(flat[:, start:start + half_D])
+        k_packed = torch.stack(k_packed_list, dim=1)  # (M, H, half_D)
 
-        key_out = self._decompress_tensor(k_indices, k_norms, self._k_quantizer).to(compute_dtype)
-        value_out = self._decompress_tensor(v_indices, v_norms, self._v_quantizer).to(compute_dtype)
+        k_norms_raw = flat[:, self._k_idx_end:self._k_norm_end].contiguous().view(
+            torch.float32
+        ).reshape(-1, H, 1)
 
-        key_cache = key_out.reshape(num_unique, BS, H, D)
-        value_cache = value_out.reshape(num_unique, BS, H, D)
+        if self._rq_mode == 'iso':
+            k_decomp = iso_decompress(
+                k_packed, k_norms_raw, self._k_quantizer.centroids, compute_dtype
+            )
+        else:
+            k_decomp = planar_decompress(
+                k_packed, k_norms_raw, self._k_quantizer.centroids, compute_dtype,
+                d_padded=self._k_quantizer.d_padded,
+            )
 
-        # Build remapped block table: old physical → compact 0..N-1
+        # Extract and decompress V
+        v_packed_list = []
+        for h in range(H):
+            start = self._k_norm_end + h * half_D
+            end = start + half_D
+            v_packed_list.append(flat[:, start:end])
+        v_packed = torch.stack(v_packed_list, dim=1)  # (M, H, half_D)
+
+        v_norms_raw = flat[:, self._v_idx_end:self._total_bytes].contiguous().view(
+            torch.float32
+        ).reshape(-1, H, 1)
+
+        if self._rq_mode == 'iso':
+            v_decomp = iso_decompress(
+                v_packed, v_norms_raw, self._v_quantizer.centroids, compute_dtype
+            )
+        else:
+            v_decomp = planar_decompress(
+                v_packed, v_norms_raw, self._v_quantizer.centroids, compute_dtype,
+                d_padded=self._v_quantizer.d_padded,
+            )
+
+        # Store in pre-allocated buffers if available
+        k_tokens = num_unique * BS
+        if out_k is not None and num_unique <= max_cap:
+            out_k[:k_tokens, :, :].copy_(k_decomp)
+            k_out = out_k[:k_tokens, :, :]
+        else:
+            k_out = k_decomp
+
+        if out_v is not None and num_unique <= max_cap:
+            out_v[:k_tokens, :, :].copy_(v_decomp)
+            v_out = out_v[:k_tokens, :, :]
+        else:
+            v_out = v_decomp
+
+        # Build remapped block table: old physical -> compact 0..N-1
         remap = torch.zeros(NB, dtype=block_table.dtype, device=block_table.device)
         remap[unique_blocks] = torch.arange(
             num_unique, dtype=block_table.dtype, device=block_table.device
         )
         remapped_block_table = remap[block_table]
 
-        return key_cache, value_cache, remapped_block_table
+        return (
+            k_out.reshape(num_unique, BS, H, D),
+            v_out.reshape(num_unique, BS, H, D),
+            remapped_block_table,
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -577,8 +794,12 @@ class RQAttentionImpl(FlashAttentionImpl):
     ):
         """RotorQuant forward: compress -> store -> decompress -> Flash Attention.
 
-        Handles edge cases (None kv_cache, encoder attention) by delegating
-        to parent or returning zero output.
+        Q pre-rotation + output post-rotation path:
+        1. Compress and store new K/V (nibble-packed, rotated space).
+        2. Pre-rotate Q by R^T into rotated space.
+        3. Paged decompress K/V (rotated space, no inverse rotation).
+        4. Flash Attention with rotated Q and decompressed K/V.
+        5. Post-rotate output by R back to original space.
         """
         assert output is not None, "Output tensor must be provided."
 
@@ -587,12 +808,8 @@ class RQAttentionImpl(FlashAttentionImpl):
                 "Fused output quantization is not supported with RotorQuant backend"
             )
 
-        # Profiling run — no metadata
-        if attn_metadata is None:
-            return output.zero_()
-
-        # Warmup with no cache allocated yet
-        if kv_cache is None:
+        # Edge cases
+        if attn_metadata is None or kv_cache is None:
             return output.zero_()
 
         # Encoder attention: delegate to parent
@@ -609,22 +826,66 @@ class RQAttentionImpl(FlashAttentionImpl):
             )
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        is_decode = (num_actual_tokens == 1)
 
-        # Step 1: Compress and store new K/V
-        if key is not None and value is not None:
-            self._compress_and_store(key, value, kv_cache, attn_metadata.slot_mapping)
+        # Lazy-init buffers
+        if not self._cg_buffers_ready:
+            self._init_cg_buffers(kv_cache, query.dtype)
 
-        # Step 2: Decompress cached K/V to FP16
-        key_cache, value_cache = self._decompress_cache(kv_cache, query.dtype)
+        if is_decode:
+            # Decode path
+            if key is not None and value is not None:
+                self._compress_and_store(
+                    key, value, kv_cache, attn_metadata.slot_mapping,
+                    compress_out=(self._cg_compress_packed, self._cg_compress_norms),
+                    row_out=self._cg_compress_row,
+                )
 
-        # Step 3: Run Flash Attention
+            # Q pre-rotation: q_rot = q @ R^T
+            q_slice = query[:1]
+            torch.matmul(q_slice.float(), self._rq_rot_T, out=self._cg_q_rot[:1])
+            self._cg_q_rot_cast[:1].copy_(self._cg_q_rot[:1])
+            q_rot = self._cg_q_rot_cast[:1]
+
+            # Paged decompress K/V
+            key_cache, value_cache, fa_block_table = self._decompress_cache_paged(
+                kv_cache, attn_metadata.block_table, attn_metadata.seq_lens,
+                query.dtype,
+                out_k=self._cg_decompress_k,
+                out_v=self._cg_decompress_v,
+            )
+        else:
+            # Prefill path
+            if key is not None and value is not None:
+                self._compress_and_store(
+                    key, value, kv_cache, attn_metadata.slot_mapping
+                )
+
+            # Q pre-rotation
+            q_slice = query[:num_actual_tokens]
+            q_rot = (q_slice.float() @ self._rq_rot_T).to(q_slice.dtype)
+
+            # Paged decompress K/V
+            key_cache, value_cache, fa_block_table = self._decompress_cache_paged(
+                kv_cache, attn_metadata.block_table, attn_metadata.seq_lens,
+                query.dtype,
+                out_k=self._cg_prefill_k,
+                out_v=self._cg_prefill_v,
+            )
+
+        # Flash Attention
         from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
         if attn_metadata.use_cascade:
-            raise NotImplementedError("RotorQuant does not yet support cascade attention")
+            raise NotImplementedError("RQ does not yet support cascade attention")
+
+        descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+        q_descale = layer._q_scale.expand(descale_shape)
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
 
         flash_attn_varlen_func(
-            q=query[:num_actual_tokens],
+            q=q_rot,
             k=key_cache,
             v=value_cache,
             out=output[:num_actual_tokens],
@@ -638,13 +899,20 @@ class RQAttentionImpl(FlashAttentionImpl):
             window_size=list(self.sliding_window)
             if self.sliding_window is not None
             else None,
-            block_table=attn_metadata.block_table,
+            block_table=fa_block_table,
             softcap=self.logits_soft_cap,
             scheduler_metadata=attn_metadata.scheduler_metadata,
             fa_version=self.vllm_flash_attn_version,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             num_splits=attn_metadata.max_num_splits,
             s_aux=self.sinks,
         )
+
+        # Output post-rotation: out_orig = out_rot @ R
+        out_slice = output[:num_actual_tokens]
+        output[:num_actual_tokens] = (out_slice.float() @ self._rq_rot).to(out_slice.dtype)
 
         return output
 

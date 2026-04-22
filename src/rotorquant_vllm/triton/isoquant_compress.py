@@ -1,8 +1,8 @@
 """
 Triton kernels for IsoQuant compress: quaternion 4D rotation + Lloyd-Max quantization.
 
-Compress path: load X → compute norm → normalize → quaternion rotate → find nearest centroids.
-Outputs: int8 indices (M, D) and fp32 norms (M,).
+Compress path: load X -> compute norm -> normalize -> quaternion rotate -> find nearest centroids.
+Outputs: nibble-packed uint8 indices (M, HALF_D) and fp32 norms (M,).
 """
 
 import torch
@@ -16,11 +16,12 @@ def _iso_compress_kernel(
     ql_ptr,
     qr_ptr,
     centroids_ptr,
-    indices_ptr,
+    packed_ptr,
     norms_ptr,
     M,
     D,
     D_padded,
+    HALF_D,
     n_groups: tl.constexpr,
     n_levels: tl.constexpr,
     has_qr: tl.constexpr,
@@ -32,20 +33,18 @@ def _iso_compress_kernel(
       1. Load D elements (padded to D_padded), compute norm, normalize
       2. For each 4D group, apply quaternion rotation (full or fast mode)
       3. Find nearest centroid index for each rotated coordinate
-      4. Store indices as int8, store norm as fp32
+      4. Pack 4 indices into 2 nibble-bytes, store as uint8
     """
     pid = tl.program_id(0)
 
-    # Group indices: element d belongs to group d // 4
-    d_offs = tl.arange(0, BLOCK_D)
-    g_offs = d_offs // 4
-    d_mask = d_offs < D_padded
-
     # ── Load input and compute norm ──────────────────────────────────────
-    x_ptrs = x_ptr + pid * D_padded + d_offs
-    x = tl.load(x_ptrs, mask=d_offs < D, other=0.0).to(tl.float32)
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
 
-    # L2 norm via manual sum (avoids tl.sqrt on partial results)
+    x_ptrs = x_ptr + pid * D_padded + d_offs
+    x = tl.load(x_ptrs, mask=d_mask, other=0.0).to(tl.float32)
+
+    # L2 norm via manual sum
     norm_sq = tl.sum(x * x)
     norm = tl.sqrt(norm_sq)
     norm = tl.maximum(norm, 1e-8)
@@ -54,15 +53,8 @@ def _iso_compress_kernel(
     # Store norm for this row
     tl.store(norms_ptr + pid, norm)
 
-    # Normalize to unit vector
-    x = x * inv_norm
-
-    # Load first centroid
-    c0 = tl.load(centroids_ptr).to(tl.float32)
-
     # ── Rotate and quantize each 4D group ────────────────────────────────
     for g in range(n_groups):
-        # Base index for this group
         g_base = g * 4
 
         # Load quaternion q_L (normalized unit quaternion, [w, x, y, z])
@@ -71,8 +63,8 @@ def _iso_compress_kernel(
         qL_y = tl.load(ql_ptr + g * 4 + 2)
         qL_z = tl.load(ql_ptr + g * 4 + 3)
 
-        # Load 4D vector block (treat as quaternion [v0, v1, v2, v3])
-        v0 = tl.load(x_ptr + pid * D_padded + g_base + 0, mask=g_base < D, other=0.0) * inv_norm
+        # Load 4D vector block (normalize inline)
+        v0 = tl.load(x_ptr + pid * D_padded + g_base + 0, mask=(g_base + 0) < D, other=0.0) * inv_norm
         v1 = tl.load(x_ptr + pid * D_padded + g_base + 1, mask=(g_base + 1) < D, other=0.0) * inv_norm
         v2 = tl.load(x_ptr + pid * D_padded + g_base + 2, mask=(g_base + 2) < D, other=0.0) * inv_norm
         v3 = tl.load(x_ptr + pid * D_padded + g_base + 3, mask=(g_base + 3) < D, other=0.0) * inv_norm
@@ -85,7 +77,6 @@ def _iso_compress_kernel(
 
         if has_qr:
             # Full mode: rotated = temp * conj(q_R)
-            # conj(q_R) = (qR_w, -qR_x, -qR_y, -qR_z)
             qR_w = tl.load(qr_ptr + g * 4 + 0)
             qR_x = tl.load(qr_ptr + g * 4 + 1)
             qR_y = tl.load(qr_ptr + g * 4 + 2)
@@ -100,12 +91,13 @@ def _iso_compress_kernel(
             r0, r1, r2, r3 = t_w, t_x, t_y, t_z
 
         # ── Quantize: find nearest centroid index for each component ─────
-        # Initialize best index to 0 for all 4 components
-        best_i0 = tl.zeros((1,), dtype=tl.int32) + 0
-        best_i1 = tl.zeros((1,), dtype=tl.int32) + 0
-        best_i2 = tl.zeros((1,), dtype=tl.int32) + 0
-        best_i3 = tl.zeros((1,), dtype=tl.int32) + 0
+        # Scalar best indices (tl.where on scalar + block yields scalar when both branches scalar)
+        best_i0 = tl.zeros((1,), dtype=tl.int32)
+        best_i1 = tl.zeros((1,), dtype=tl.int32)
+        best_i2 = tl.zeros((1,), dtype=tl.int32)
+        best_i3 = tl.zeros((1,), dtype=tl.int32)
 
+        c0 = tl.load(centroids_ptr).to(tl.float32)
         best_d0 = tl.abs(r0 - c0)
         best_d1 = tl.abs(r1 - c0)
         best_d2 = tl.abs(r2 - c0)
@@ -132,15 +124,20 @@ def _iso_compress_kernel(
             best_i2 = tl.where(m2, i, best_i2)
             best_i3 = tl.where(m3, i, best_i3)
 
-        # ── Store indices as int8 ─────────────────────────────────────────
-        tl.store(indices_ptr + pid * D_padded + g_base + 0,
-                 best_i0.to(tl.int8), mask=g_base < D)
-        tl.store(indices_ptr + pid * D_padded + g_base + 1,
-                 best_i1.to(tl.int8), mask=(g_base + 1) < D)
-        tl.store(indices_ptr + pid * D_padded + g_base + 2,
-                 best_i2.to(tl.int8), mask=(g_base + 2) < D)
-        tl.store(indices_ptr + pid * D_padded + g_base + 3,
-                 best_i3.to(tl.int8), mask=(g_base + 3) < D)
+        # ── Nibble pack: pair (idx0,idx1) and (idx2,idx3) into 2 bytes ──
+        # High nibble = even index, low nibble = odd index
+        # best_i* are 1-element blocks; << and | produce 1-element blocks
+        # We store them to 1-element block pointers
+        packed_pair0 = (best_i0.to(tl.uint8) << 4) | best_i1.to(tl.uint8)
+        packed_pair1 = (best_i2.to(tl.uint8) << 4) | best_i3.to(tl.uint8)
+
+        packed_base = pid * HALF_D + g * 2
+        # Store as 1-element blocks using tl.arange(0, 1) offsets
+        off0 = tl.arange(0, 1)
+        tl.store(packed_ptr + packed_base + off0,
+                 packed_pair0, mask=(g * 2 + 0) < HALF_D)
+        tl.store(packed_ptr + packed_base + 1 + off0,
+                 packed_pair1, mask=(g * 2 + 1) < HALF_D)
 
 
 def iso_compress(x: torch.Tensor,
@@ -149,7 +146,7 @@ def iso_compress(x: torch.Tensor,
                  centroids: torch.Tensor,
                  mode: str = "fast",
                  d_padded: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compress (N, H, D) float tensor to int8 indices + fp32 norms via IsoQuant.
+    """Compress (N, H, D) float tensor to nibble-packed uint8 + fp32 norms via IsoQuant.
 
     Args:
         x: Input tensor of shape (N, H, D), dtype fp16 or bf16.
@@ -160,8 +157,8 @@ def iso_compress(x: torch.Tensor,
         d_padded: Padded dimension (multiple of 4). Auto-computed from D if None.
 
     Returns:
-        indices: (N, H, D_padded) int8 tensor of centroid indices.
-        norms:   (N, H, 1) fp32 tensor of vector norms.
+        packed: (N, H, HALF_D) uint8 tensor of nibble-packed centroid indices.
+        norms:  (N, H, 1) fp32 tensor of vector norms.
     """
     N, H, D = x.shape
     n_levels = centroids.shape[0]
@@ -169,6 +166,7 @@ def iso_compress(x: torch.Tensor,
 
     if d_padded is None:
         d_padded = ((D + 3) // 4) * 4
+    HALF_D = d_padded // 2
 
     M = N * H
     has_qr = (q_R is not None) and (mode == "full")
@@ -189,7 +187,7 @@ def iso_compress(x: torch.Tensor,
         qr_f32 = torch.ones(n_groups, 4, device=q_L.device, dtype=torch.float32)
     centroids_f32 = centroids.float().contiguous()
 
-    indices = torch.empty(M, d_padded, device=x.device, dtype=torch.int8)
+    packed = torch.empty(M, HALF_D, device=x.device, dtype=torch.uint8)
     norms = torch.empty(M, device=x.device, dtype=torch.float32)
 
     BLOCK_D = min(triton.next_power_of_2(d_padded), 128)
@@ -200,21 +198,21 @@ def iso_compress(x: torch.Tensor,
             ql_f32,
             qr_f32,
             centroids_f32,
-            indices,
+            packed,
             norms,
             M,
             D,
             d_padded,
+            HALF_D,
             n_groups,
             n_levels,
             has_qr,
             BLOCK_D=BLOCK_D,
         )
     except Exception:
-        # CPU fallback
         return _iso_compress_cpu(x, q_L, q_R, centroids, mode, d_padded)
 
-    return indices.reshape(N, H, d_padded), norms.reshape(N, H, 1)
+    return packed.reshape(N, H, HALF_D), norms.reshape(N, H, 1)
 
 
 def _iso_compress_cpu(x: torch.Tensor,
@@ -229,6 +227,7 @@ def _iso_compress_cpu(x: torch.Tensor,
 
     if d_padded is None:
         d_padded = ((D + 3) // 4) * 4
+    HALF_D = d_padded // 2
 
     M = N * H
     has_qr = (q_R is not None) and (mode == "full")
@@ -249,7 +248,6 @@ def _iso_compress_cpu(x: torch.Tensor,
 
     # Forward rotation
     qL = q_L.float()  # (n_groups, 4)
-    # q_L * v for each group
     aw, ax, ay, az = qL.unbind(-1)
     v0, v1, v2, v3 = groups.unbind(-1)
 
@@ -273,6 +271,10 @@ def _iso_compress_cpu(x: torch.Tensor,
     # Find nearest centroid
     rotated_flat = rotated.reshape(M, d_padded)
     diffs = (rotated_flat.unsqueeze(-1) - centroids).abs()
-    indices = diffs.argmin(dim=-1)
+    indices = diffs.argmin(dim=-1)  # (M, d_padded)
 
-    return indices.to(torch.int8).reshape(N, H, d_padded), norms.reshape(N, H, 1)
+    # Nibble pack: (M, D_padded) -> (M, HALF_D)
+    idx_u8 = indices.to(torch.uint8)
+    packed = (idx_u8[:, 0::2] << 4) | idx_u8[:, 1::2]
+
+    return packed.reshape(N, H, HALF_D), norms.reshape(N, H, 1)

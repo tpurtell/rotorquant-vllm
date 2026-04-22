@@ -1,8 +1,9 @@
 """
-Triton kernels for PlanarQuant compress: Givens 2D rotation + Lloyd-Max quantization.
+Triton kernels for PlanarQuant compress: Givens 2D rotation + Lloyd-Max quantization + nibble packing.
 
-Compress path: load X → compute norm → normalize → Givens rotate pairs → find nearest centroids.
-Outputs: int8 indices (M, D) and fp32 norms (M,).
+Compress path: load X → compute norm → normalize → Givens rotate pairs → find nearest centroids
+→ pack 2 indices into 1 byte (4-bit nibbles).
+Outputs: uint8 nibble-packed indices (M, HALF_D) and fp32 norms (M,).
 """
 
 import torch
@@ -15,7 +16,7 @@ def _planar_compress_kernel(
     x_ptr,
     rot2_ptr,
     centroids_ptr,
-    indices_ptr,
+    packed_ptr,
     norms_ptr,
     M,
     D,
@@ -30,7 +31,8 @@ def _planar_compress_kernel(
       1. Load D elements (padded to D_padded), compute norm, normalize
       2. For each 2D pair, apply Givens rotation: r0=c*v0-s*v1, r1=s*v0+c*v1
       3. Find nearest centroid index for each rotated coordinate
-      4. Store indices as int8, norm as fp32
+      4. Pack 2 indices into 1 byte: packed[g] = (best_i0 << 4) | best_i1
+      5. Store norm as fp32
     """
     pid = tl.program_id(0)
 
@@ -86,18 +88,17 @@ def _planar_compress_kernel(
             best_i0 = tl.where(m0, i, best_i0)
             best_i1 = tl.where(m1, i, best_i1)
 
-        # ── Store indices as int8 ─────────────────────────────────────────
-        tl.store(indices_ptr + pid * D_padded + g_base + 0,
-                 best_i0.to(tl.int8), mask=g_base < D)
-        tl.store(indices_ptr + pid * D_padded + g_base + 1,
-                 best_i1.to(tl.int8), mask=(g_base + 1) < D)
+        # ── Pack 2 indices into 1 byte (nibble packing) ──────────────────
+        packed_val = (best_i0.to(tl.int32) << 4) | best_i1.to(tl.int32)
+        tl.store(packed_ptr + pid * (D_padded // 2) + g,
+                 packed_val.to(tl.uint8), mask=g_base < D)
 
 
 def planar_compress(x: torch.Tensor,
                     rot2: torch.Tensor,
                     centroids: torch.Tensor,
                     d_padded: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compress (N, H, D) float tensor to int8 indices + fp32 norms via PlanarQuant.
+    """Compress (N, H, D) float tensor to nibble-packed uint8 indices + fp32 norms via PlanarQuant.
 
     Args:
         x: Input tensor of shape (N, H, D), dtype fp16 or bf16.
@@ -106,8 +107,8 @@ def planar_compress(x: torch.Tensor,
         d_padded: Padded dimension (multiple of 2). Auto-computed from D if None.
 
     Returns:
-        indices: (N, H, D_padded) int8 tensor of centroid indices.
-        norms:   (N, H, 1) fp32 tensor of vector norms.
+        packed: (N, H, HALF_D) uint8 tensor of nibble-packed centroid indices.
+        norms:  (N, H, 1) fp32 tensor of vector norms.
     """
     N, H, D = x.shape
     n_levels = centroids.shape[0]
@@ -116,6 +117,7 @@ def planar_compress(x: torch.Tensor,
     if d_padded is None:
         d_padded = ((D + 1) // 2) * 2
 
+    HALF_D = d_padded // 2
     M = N * H
 
     # Ensure contiguous layout and convert to fp32
@@ -130,7 +132,7 @@ def planar_compress(x: torch.Tensor,
     rot2_f32 = rot2.float().contiguous()
     centroids_f32 = centroids.float().contiguous()
 
-    indices = torch.empty(M, d_padded, device=x.device, dtype=torch.int8)
+    packed = torch.empty(M, HALF_D, device=x.device, dtype=torch.uint8)
     norms = torch.empty(M, device=x.device, dtype=torch.float32)
 
     BLOCK_D = min(triton.next_power_of_2(d_padded), 128)
@@ -140,7 +142,7 @@ def planar_compress(x: torch.Tensor,
             x_f32,
             rot2_f32,
             centroids_f32,
-            indices,
+            packed,
             norms,
             M,
             D,
@@ -153,7 +155,7 @@ def planar_compress(x: torch.Tensor,
         # CPU fallback
         return _planar_compress_cpu(x, rot2, centroids, d_padded)
 
-    return indices.reshape(N, H, d_padded), norms.reshape(N, H, 1)
+    return packed.reshape(N, H, HALF_D), norms.reshape(N, H, 1)
 
 
 def _planar_compress_cpu(x: torch.Tensor,
@@ -167,6 +169,7 @@ def _planar_compress_cpu(x: torch.Tensor,
     if d_padded is None:
         d_padded = ((D + 1) // 2) * 2
 
+    HALF_D = d_padded // 2
     M = N * H
 
     x_f32 = x.float().contiguous()
@@ -196,6 +199,10 @@ def _planar_compress_cpu(x: torch.Tensor,
     # Find nearest centroid
     rotated_flat = rotated.reshape(M, d_padded)
     diffs = (rotated_flat.unsqueeze(-1) - centroids).abs()
-    indices = diffs.argmin(dim=-1)
+    indices = diffs.argmin(dim=-1)  # (M, d_padded)
 
-    return indices.to(torch.int8).reshape(N, H, d_padded), norms.reshape(N, H, 1)
+    # Nibble pack: 2 indices per byte
+    idx_u8 = indices.to(torch.uint8)
+    packed = (idx_u8[:, 0::2] << 4) | idx_u8[:, 1::2]  # (M, HALF_D)
+
+    return packed.reshape(N, H, HALF_D), norms.reshape(N, H, 1)
