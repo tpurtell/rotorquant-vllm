@@ -28,12 +28,12 @@ def make_random_rotations(n_groups: int, device: str = 'cpu', seed: int = None) 
 
     Returns: (n_groups, 2) as [cos theta, sin theta]
     """
-    gen = torch.Generator(device='cpu')
+    torch_device = torch.device(device)
+    gen_device = torch_device.type
+    gen = torch.Generator(device=gen_device)
     if seed is not None:
         gen.manual_seed(seed)
-    # Random angles in [0, 2*pi)
-    angles = torch.rand(n_groups, generator=gen) * (2 * math.pi)
-    angles = angles.to(device)
+    angles = torch.rand(n_groups, generator=gen, device=torch_device) * (2 * math.pi)
     return torch.stack([angles.cos(), angles.sin()], dim=-1)
 
 

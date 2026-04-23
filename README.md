@@ -73,17 +73,35 @@ src/rotorquant_vllm/
     └── rq_backend.py            # RQAttentionBackend, RQAttentionImpl, registration
 ```
 
-## Roadmap
+## Status
+
+Implemented:
 
 - [x] Core quantization (IsoQuant, PlanarQuant)
 - [x] Triton compress/decompress kernels with CPU fallbacks
-- [x] vLLM plugin registration (CUSTOM backend)
-- [x] Packed KV cache with real VRAM savings
-- [x] Paged decompression (only referenced blocks)
-- [ ] Nibble packing for 3-bit storage (2.67x compression)
-- [ ] Fused paged decode kernel
-- [ ] Deferred K-cache quantization (FP16 prefill)
-- [ ] CUDA graph support
+- [x] Nibble-packed KV cache
+- [x] Boundary-based bucketize in compress kernels
+- [x] Pre-split rotation matrices for tiled compress
+- [x] Tiled compress kernels
+- [x] Paged decompression
+- [x] Fused paged decode kernel
+- [x] Fused INT8 prefill kernel
+- [x] CUDA graph support for uniform single-token decode
+- [x] Hybrid-model page alignment
+- [x] VLM/mm_prefix support
+- [x] Experiment scripts and integration tests
+
+Remaining limitation:
+
+- [ ] Cascade attention (matches turboquant-vllm: not implemented)
+## Credits
+
+This project was built from the RotorQuant and TurboQuant-vLLM work in the sibling repositories in this directory:
+
+- `../rotorquant` — source quantization work and reference implementations for IsoQuant/PlanarQuant, Lloyd-Max codebooks, and the underlying RotorQuant design.
+- `../turboquant-vllm` — reference vLLM plugin architecture, Triton kernel structure, fused paged decode, INT8 prefill, and performance benchmarking patterns.
+
+This repository is a RotorQuant-based vLLM backend built by adapting ideas and implementation patterns from both codebases to RotorQuant's block-diagonal rotation design.
 
 ## References
 

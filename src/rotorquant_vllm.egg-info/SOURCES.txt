@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 src/rotorquant_vllm/__init__.py
 src/rotorquant_vllm.egg-info/PKG-INFO
@@ -11,9 +12,13 @@ src/rotorquant_vllm/quantization/isoquant.py
 src/rotorquant_vllm/quantization/lloyd_max.py
 src/rotorquant_vllm/quantization/planarquant.py
 src/rotorquant_vllm/triton/__init__.py
+src/rotorquant_vllm/triton/fused_paged_rq_decode.py
+src/rotorquant_vllm/triton/fused_paged_rq_int8_prefill.py
 src/rotorquant_vllm/triton/isoquant_compress.py
 src/rotorquant_vllm/triton/isoquant_decompress.py
 src/rotorquant_vllm/triton/planarquant_compress.py
 src/rotorquant_vllm/triton/planarquant_decompress.py
 src/rotorquant_vllm/vllm/__init__.py
 src/rotorquant_vllm/vllm/rq_backend.py
+tests/test_benchmarks.py
+tests/test_vllm_integration.py

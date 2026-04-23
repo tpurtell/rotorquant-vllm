@@ -112,7 +112,7 @@ def _parse_iso_mode() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fused paged decode feature gate
+# Fused paged kernel feature gates
 # ---------------------------------------------------------------------------
 
 _fused_paged_kernel_available = False
@@ -126,6 +126,16 @@ try:
 except (ImportError, RuntimeError) as exc:
     logger.info("Fused paged RQ decode kernel unavailable: %s", exc)
 
+_fused_prefill_kernel_available = False
+_fused_paged_rq_int8_prefill_fn = None
+try:
+    from rotorquant_vllm.triton.fused_paged_rq_int8_prefill import (
+        fused_paged_rq_int8_prefill as _fused_paged_rq_int8_prefill_fn,
+    )
+
+    _fused_prefill_kernel_available = True
+except (ImportError, RuntimeError) as exc:
+    logger.info("Fused paged RQ int8 prefill kernel unavailable: %s", exc)
 
 def _parse_rq_fused_paged_env() -> bool:
     """Parse ``RQ_USE_FUSED_PAGED`` environment variable.
@@ -471,11 +481,12 @@ class RQAttentionImpl(FlashAttentionImpl):
         # Half dimension for nibble packing
         self._half_d = head_size // 2
 
-        # Byte layout offsets (nibble-packed)
+        # Byte layout offsets (compact nibble-packed payload within padded slot)
         k_idx_per_head = self._half_d
         self._k_idx_end = num_kv_heads * k_idx_per_head
         self._k_norm_end = self._k_idx_end + num_kv_heads * RQ_NORM_BYTES
         self._v_idx_end = self._k_norm_end + num_kv_heads * k_idx_per_head
+        self._v_norm_end = self._v_idx_end + num_kv_heads * RQ_NORM_BYTES
         self._total_bytes = _rq_total_bytes(head_size, num_kv_heads)
 
         # Pre-allocated buffers flag and limits
@@ -489,9 +500,12 @@ class RQAttentionImpl(FlashAttentionImpl):
         )
 
 
-        # Fused paged decode feature gate.
+        # Fused paged kernel feature gates.
         self._fused_paged_available = (
             _parse_rq_fused_paged_env() and _fused_paged_kernel_available
+        )
+        self._fused_prefill_available = (
+            _parse_rq_fused_paged_env() and _fused_prefill_kernel_available
         )
 
         # Log compression ratio
@@ -509,8 +523,9 @@ class RQAttentionImpl(FlashAttentionImpl):
             compression,
         )
         logger.info(
-            "Fused paged RQ decode: %s",
+            "Fused paged RQ decode: %s; fused paged RQ int8 prefill: %s",
             "enabled" if self._fused_paged_available else "disabled",
+            "enabled" if self._fused_prefill_available else "disabled",
         )
 
     # ------------------------------------------------------------------
@@ -631,9 +646,11 @@ class RQAttentionImpl(FlashAttentionImpl):
         v_packed_flat = v_packed.reshape(N, H * self._half_d)
         row[:, self._k_norm_end:self._v_idx_end] = v_packed_flat
         # V norms: fp32 -> uint8 view
-        row[:, self._v_idx_end:self._total_bytes] = (
+        row[:, self._v_idx_end:self._v_norm_end] = (
             v_norms.reshape(N, H).contiguous().view(torch.uint8)
         )
+        if self._v_norm_end < self._total_bytes:
+            row[:, self._v_norm_end:self._total_bytes] = 0
 
         # Scatter-write to flat cache using slot_mapping
         flat_cache = kv_cache.view(-1, kv_cache.shape[-1])
@@ -697,7 +714,7 @@ class RQAttentionImpl(FlashAttentionImpl):
             v_packed_list.append(flat[:, start:end])
         v_packed = torch.stack(v_packed_list, dim=1)  # (M, H, half_D)
 
-        v_norms_raw = flat[:, self._v_idx_end:self._total_bytes].contiguous().view(
+        v_norms_raw = flat[:, self._v_idx_end:self._v_norm_end].contiguous().view(
             torch.float32
         ).reshape(-1, H, 1)
 
@@ -793,7 +810,7 @@ class RQAttentionImpl(FlashAttentionImpl):
             v_packed_list.append(flat[:, start:end])
         v_packed = torch.stack(v_packed_list, dim=1)  # (M, H, half_D)
 
-        v_norms_raw = flat[:, self._v_idx_end:self._total_bytes].contiguous().view(
+        v_norms_raw = flat[:, self._v_idx_end:self._v_norm_end].contiguous().view(
             torch.float32
         ).reshape(-1, H, 1)
 
@@ -899,13 +916,30 @@ class RQAttentionImpl(FlashAttentionImpl):
                     row_out=self._cg_compress_row,
                 )
 
-            # Q pre-rotation: q_rot = q @ R^T
+            # Decode fast path: use fused paged kernel when enabled.
+            if self._fused_paged_available:
+                _fused_paged_rq_decode_fn(
+                    query[:1],
+                    kv_cache,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    self._k_quantizer.centroids,
+                    self._v_quantizer.centroids,
+                    self._rq_rot,
+                    self.num_kv_heads,
+                    self.head_size,
+                    kv_cache.shape[1],
+                    sm_scale=self.scale,
+                    out=output[:1],
+                )
+                return output
+            
+            # Non-fused fallback: pre-rotate Q and paged-decompress K/V.
             q_slice = query[:1]
             torch.matmul(q_slice.float(), self._rq_rot_T, out=self._cg_q_rot[:1])
             self._cg_q_rot_cast[:1].copy_(self._cg_q_rot[:1])
             q_rot = self._cg_q_rot_cast[:1]
 
-            # Paged decompress K/V
             key_cache, value_cache, fa_block_table = self._decompress_cache_paged(
                 kv_cache, attn_metadata.block_table, attn_metadata.seq_lens,
                 query.dtype,
@@ -919,17 +953,44 @@ class RQAttentionImpl(FlashAttentionImpl):
                     key, value, kv_cache, attn_metadata.slot_mapping
                 )
 
-            # Q pre-rotation
+            # Fast prefill path: fused INT8 kernel supports only one sequence.
+            if (
+                self._fused_prefill_available
+                and attn_metadata.seq_lens.numel() == 1
+                and not attn_metadata.use_cascade
+            ):
+                _fused_paged_rq_int8_prefill_fn(
+                    query[:num_actual_tokens],
+                    kv_cache,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    self._k_quantizer.centroids,
+                    self._v_quantizer.centroids,
+                    self._rq_rot,
+                    self.num_kv_heads,
+                    self.head_size,
+                    kv_cache.shape[1],
+                    sm_scale=self.scale,
+                    out=output[:num_actual_tokens],
+                )
+                return output
+
+            # Non-fused prefill fallback.
             q_slice = query[:num_actual_tokens]
             q_rot = (q_slice.float() @ self._rq_rot_T).to(q_slice.dtype)
 
-            # Paged decompress K/V
-            key_cache, value_cache, fa_block_table = self._decompress_cache_paged(
-                kv_cache, attn_metadata.block_table, attn_metadata.seq_lens,
-                query.dtype,
-                out_k=self._cg_prefill_k,
-                out_v=self._cg_prefill_v,
-            )
+            # CUDA graph capture cannot use dynamic block-table filtering
+            # (boolean indexing / unique). Fall back to full-cache decompress.
+            if torch.cuda.is_current_stream_capturing():
+                key_cache, value_cache = self._decompress_cache(kv_cache, query.dtype)
+                fa_block_table = attn_metadata.block_table
+            else:
+                key_cache, value_cache, fa_block_table = self._decompress_cache_paged(
+                    kv_cache, attn_metadata.block_table, attn_metadata.seq_lens,
+                    query.dtype,
+                    out_k=self._cg_prefill_k,
+                    out_v=self._cg_prefill_v,
+                )
 
         # Flash Attention
         from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func

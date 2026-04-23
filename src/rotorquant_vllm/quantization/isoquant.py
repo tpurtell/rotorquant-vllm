@@ -46,10 +46,12 @@ def quat_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def make_random_unit_quaternion(shape: Tuple[int, ...],
                                 device: str = 'cpu', seed: int = None) -> torch.Tensor:
     """Generate random unit quaternions via normalized Gaussian."""
-    gen = torch.Generator(device='cpu')
+    torch_device = torch.device(device)
+    gen_device = torch_device.type
+    gen = torch.Generator(device=gen_device)
     if seed is not None:
         gen.manual_seed(seed)
-    q = torch.randn(*shape, 4, generator=gen).to(device)
+    q = torch.randn(*shape, 4, generator=gen, device=torch_device)
     return q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
 
