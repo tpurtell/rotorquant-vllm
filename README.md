@@ -98,8 +98,8 @@ Remaining limitation:
 
 This project was built from the RotorQuant and TurboQuant-vLLM work in the sibling repositories in this directory:
 
-- `../rotorquant` — source quantization work and reference implementations for IsoQuant/PlanarQuant, Lloyd-Max codebooks, and the underlying RotorQuant design.
-- `../turboquant-vllm` — reference vLLM plugin architecture, Triton kernel structure, fused paged decode, INT8 prefill, and performance benchmarking patterns.
+- [RotorQuant](https://github.com/scrya-com/rotorquant) — source quantization work and reference implementations for IsoQuant/PlanarQuant, Lloyd-Max codebooks, and the underlying RotorQuant design.
+- [TurboQuantVLLM](https://github.com/Alberto-Codes/turboquant-vllm) — reference vLLM plugin architecture, Triton kernel structure, fused paged decode, INT8 prefill, and performance benchmarking patterns.
 
 This repository is a RotorQuant-based vLLM backend built by adapting ideas and implementation patterns from both codebases to RotorQuant's block-diagonal rotation design.
 
